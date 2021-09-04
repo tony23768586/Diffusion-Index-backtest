@@ -1,0 +1,379 @@
+import pandas as pd
+import numpy as np
+import matplotlib.pyplot as plt
+import ffn
+import copy
+import time
+%matplotlib inline
+plt.rcParams['font.sans-serif'] = ['Microsoft JhengHei'] # 解決 plot中文問題
+plt.rcParams['axes.unicode_minus'] = False
+
+#%% tearsheet 函式
+def create_annulized_return(cumreturns):
+    return ((cumreturns.iloc[[-1]]) ** (1 / (len(cumreturns)/252)) -1).iloc[0]
+
+def create_annulized_volatility(returns):
+    return (np.std(returns) * np.sqrt(252))
+
+def create_sharpe_ratio(cumreturns,returns):
+    return  create_annulized_return(cumreturns) / create_annulized_volatility(returns)
+
+def get_tearsheet(returns):
+    cumreturns = np.exp(np.log(1 + returns).cumsum())
+
+    tearsheet = {}
+    tearsheet['年化報酬率'] = create_annulized_return(cumreturns)
+    tearsheet['年化波動率'] = create_annulized_volatility(returns)
+    tearsheet["sharpe"] = create_sharpe_ratio(cumreturns,returns)
+    tearsheet["最大回撤"] = ffn.calc_max_drawdown(cumreturns) # 取用 ffn套件功能
+    
+    tearsheet = pd.DataFrame.from_dict(tearsheet, orient='index').T
+    return tearsheet
+
+#%% 各種指標 函式
+def open_writer(technical_indicators,moving_style):
+    writer = pd.ExcelWriter('各策略績效表與圖形/' + technical_indicators + ' ' + moving_style + ' 簡單平滑.xlsx')
+    return writer 
+
+def cal_diffusion_indicators(raw_data_price ,technical_indicators ,moving_style ,period):
+
+    # 若不做 copy.deepcopy()的動作，會出現 SettingWithCopyWarning
+    raw_data_price_market = copy.deepcopy(raw_data_price[raw_data_price['成份股'] == 'Y9999 加權指數'])
+    raw_data_price_0050 = copy.deepcopy(raw_data_price[raw_data_price['成份股'] != 'Y9999 加權指數'])
+    
+    # 計算 MA指標下的擴散指標
+    if technical_indicators in ['MA指標']:
+        
+        raw_data_price_0050['MA'] = raw_data_price_0050.groupby('成份股')['收盤價(元)']\
+            .apply(lambda x: x.rolling(period,min_periods = period).mean())
+                                                            
+        raw_data_price_0050 = raw_data_price_0050.dropna(subset=['MA'])
+           
+        raw_data_price_0050['signal'] = np.where(raw_data_price_0050['收盤價(元)'] >=\
+                                                 raw_data_price_0050['MA'] ,1 ,0)
+    # 計算 ROC指標下的擴散指標
+    elif technical_indicators in ['ROC指標']:
+        
+        raw_data_price_0050['ROC'] = raw_data_price_0050.groupby('成份股')['收盤價(元)']\
+            .apply(lambda x: x.pct_change(period))
+        
+        raw_data_price_0050 = raw_data_price_0050.dropna(subset=['ROC'])
+        
+        raw_data_price_0050['signal'] = np.where(raw_data_price_0050['ROC'] >= 0,1,0)
+    
+    # 計算 KDJ指標下的擴散指標
+    elif technical_indicators in ['KDJ指標_K_cross_D','KDJ指標_D']:
+        
+        raw_data_price_0050['high'] = raw_data_price_0050.groupby('成份股')['收盤價(元)'].\
+            apply(lambda x: x.rolling(period,min_periods=period).max())
+            
+        raw_data_price_0050['low'] = raw_data_price_0050.groupby('成份股')['收盤價(元)'].\
+            apply(lambda x: x.rolling(period,min_periods=period).min())
+            
+        raw_data_price_0050['RSV'] = (raw_data_price_0050['收盤價(元)'] - raw_data_price_0050['low']) * 100 / \
+            (raw_data_price_0050['high'] - raw_data_price_0050['low'])
+
+        raw_data_price_0050 = raw_data_price_0050.dropna(subset=['RSV'])
+        
+        raw_data_price_0050['K'] = raw_data_price_0050.groupby('成份股')['RSV'].\
+            apply(lambda x: x.ewm(com=2).mean())
+     
+        raw_data_price_0050['D'] = raw_data_price_0050.groupby('成份股')['K'].\
+            apply(lambda x: x.ewm(com=2).mean())
+            
+        if technical_indicators in ['KDJ指標_K_cross_D']:            
+            raw_data_price_0050['signal'] =  np.where(raw_data_price_0050['K'] >= raw_data_price_0050['D'],1,0)
+        
+        else:
+            raw_data_price_0050['signal'] =  np.where(raw_data_price_0050['D'] >= 70,1,0)
+    
+    # 計算 RSI指標下的擴散指標
+    else:
+        raw_data_price_0050['收盤價差額'] = raw_data_price_0050.groupby('成份股')['收盤價(元)'].diff(1).shift(-1).fillna(0)
+        
+        raw_data_price_0050['收盤價正差額'] = np.where(raw_data_price_0050['收盤價差額'] >= 0,
+                                                 raw_data_price_0050['收盤價差額'],0)
+        
+        raw_data_price_0050['收盤價負差額'] = np.where(raw_data_price_0050['收盤價差額'] < 0,
+                                                 abs(raw_data_price_0050['收盤價差額']),0)
+        
+        raw_data_price_0050['N日漲幅的平均值'] = raw_data_price_0050.groupby('成份股')['收盤價正差額']\
+            .rolling(period,min_periods=period).mean().reset_index()['收盤價正差額']
+            
+        raw_data_price_0050['N日跌幅的平均值'] = raw_data_price_0050.groupby('成份股')['收盤價負差額']\
+            .rolling(period,min_periods=period).mean().reset_index()['收盤價負差額']
+        
+        raw_data_price_0050['RSI'] = (100 * raw_data_price_0050['N日漲幅的平均值']) / \
+           (raw_data_price_0050['N日漲幅的平均值'] + raw_data_price_0050['N日跌幅的平均值'])
+       
+        raw_data_price_0050['signal'] =  np.where(raw_data_price_0050['RSI'] >= 60,1,0)       
+    
+    
+    raw_data_price_0050 = raw_data_price_0050.merge(raw_data[['年月日', '成份股', '前日市值比重']],
+                                                    how="left", on=['年月日', '成份股'])    
+    
+    raw_data_price_0050 = raw_data_price_0050.dropna(subset=['前日市值比重'])
+    
+    # 等權重加權
+    if moving_style in ['等權重']:
+        
+        raw_data_price_market = raw_data_price_market.merge(
+            pd.DataFrame(raw_data_price_0050.groupby('年月日')['signal'].sum() / \
+                         raw_data_price_0050.groupby('年月日')['年月日'].size(),
+                         columns = ['擴散指標']).reset_index(), how="left", on=['年月日'])
+    
+    # 流通市值加權
+    else:
+        raw_data_price_0050['signal'] = raw_data_price_0050['signal'] * raw_data_price_0050['前日市值比重']
+        
+        raw_data_price_market = raw_data_price_market.merge(
+            pd.DataFrame(raw_data_price_0050.groupby('年月日')['signal'].sum(),
+                         columns = ['signal']).rename(columns={"signal": "擴散指標"})\
+                .reset_index(), how="left", on=['年月日'])
+            
+    raw_data_price_market = raw_data_price_market.dropna(subset=['擴散指標'])
+    raw_data_price_market['signal'] = np.where(raw_data_price_market['擴散指標'] >= 0.5,1,0)
+    raw_data_price_market['報酬率'] = raw_data_price_market['開盤價(元)'].pct_change().shift(-1).fillna(0.0)
+    raw_data_price_market['策略報酬率'] = raw_data_price_market['報酬率'] * raw_data_price_market['signal'].shift(1)
+    
+    return raw_data_price_market
+
+
+#%% 作圖 函式
+def draw_plots(raw_data_price_market,technical_indicators,moving_style, N1, N2, N3):
+    fig1, (ax1, ax2 ,ax3) = plt.subplots(3, 1,figsize=(30,30), gridspec_kw={'height_ratios': [1,1,1]})
+
+    raw_data_price_market.index = raw_data_price_market['年月日']
+    
+    # 第一張：呈現策略在加權指數上的表現
+    raw_data_price_market['signal'] = np.where(raw_data_price_market['快線'] >=raw_data_price_market['慢線'],1,0)
+    
+    pos_signal = raw_data_price_market.copy()
+    neg_signal = raw_data_price_market.copy()
+    
+    pos_signal['收盤價(元)'] = np.where(pos_signal['signal'] == 1,pos_signal['收盤價(元)'] ,np.nan)
+    neg_signal['收盤價(元)'] = np.where(neg_signal['signal'] == 0,neg_signal['收盤價(元)'] ,np.nan)
+
+    ax1.plot(pos_signal['收盤價(元)'] ,label = raw_data_price_market['成份股'].unique()[0] + ' up線' , color='r')
+    ax1.plot(neg_signal['收盤價(元)'] ,label = raw_data_price_market['成份股'].unique()[0] + ' down線' , color='g')                     
+    ax1.legend(loc='best',fontsize=20)
+    ax1.grid()
+    
+    # 第二張：平滑擴散指數，獲得快慢線
+    ax2.plot(raw_data_price_market[['快線','慢線']],label=['快線','慢線']) 
+    ax2.legend(loc='best',fontsize=20)
+    ax2.set_title('N1=' + str(N1) + '  N2='+ str(N2) + '  N3=' + str(N3), fontsize=30)
+    ax2.grid()
+    
+    # 第三張：做多、做空、多空、加權指數的淨值曲線
+    ax3.plot(np.exp(np.log(1 + raw_data_price_market[['報酬率','策略報酬率做多',
+                                                      '策略報酬率做空','策略報酬率多空']]).cumsum()),
+                    label=['台灣加權指數淨值','做多策略淨值','做空策略淨值','多空策略淨值']) 
+    ax3.legend(loc='best',fontsize=20)
+    ax3.set_title(technical_indicators + " " + moving_style, fontsize=30)
+    ax3.grid()
+    
+    return fig1.savefig('各策略績效表與圖形/' + technical_indicators + ' ' + moving_style + ' 簡單平滑.png',
+                        dpi=300, bbox_inches='tight')
+    plt.clf()  
+
+#%% 平滑擴散指標，產生快慢線 函式
+
+def cal_moving_first_diffusion_indicators(raw_data_price,writer,technical_indicators,moving_style,lower,upper):
+    # 第一次平滑
+    tearsheet_all = pd.DataFrame()
+    for period in range(lower, upper, 10):
+        raw_data_price_market = cal_diffusion_indicators(raw_data_price, technical_indicators,
+                                                         moving_style, period)
+        
+        tearsheet = get_tearsheet(raw_data_price_market['策略報酬率'])
+        tearsheet_all = tearsheet_all.append(tearsheet, ignore_index=True)
+        
+    tearsheet_all.index = range(lower, upper, 10)
+    N1 = tearsheet_all[tearsheet_all.sharpe == max(tearsheet_all.sharpe)].index.tolist()[0]
+    tearsheet_all.round(2).to_excel(writer, sheet_name= str(N1))
+    
+    return N1
+
+def cal_moving_second_diffusion_indicators(raw_data_price,writer,technical_indicators,moving_style,
+                                           N1,lower_second,lower_third):    
+    # 第二次平滑
+    tearsheet_all = pd.DataFrame()
+    for period in range(lower_second, N1, 10):
+        raw_data_price_market = cal_diffusion_indicators(raw_data_price, technical_indicators,
+                                                         moving_style, N1)
+        
+        raw_data_price_market['快線'] = raw_data_price_market['擴散指標'].\
+            rolling(period,min_periods=period).mean()
+        raw_data_price_market['signal'] = np.where(raw_data_price_market['快線'] >= 0.5,1,0)
+        
+        raw_data_price_market['策略報酬率'] = raw_data_price_market['報酬率'] * \
+            raw_data_price_market['signal']
+    
+        tearsheet = get_tearsheet(raw_data_price_market['策略報酬率'])
+        tearsheet_all = tearsheet_all.append(tearsheet, ignore_index=True)
+    
+    tearsheet_all.index = range(lower_second, N1, 10)
+    N2 = tearsheet_all[tearsheet_all.sharpe == max(tearsheet_all.sharpe)].index.tolist()[0]
+    tearsheet_all.round(2).to_excel(writer, sheet_name= str(N2))
+    
+    # 第三次平滑
+    tearsheet_all = pd.DataFrame()
+    for period in range(lower_third, N2, 5):
+        raw_data_price_market = cal_diffusion_indicators(raw_data_price, technical_indicators,
+                                                         moving_style, N1)
+        
+        raw_data_price_market['快線'] = raw_data_price_market['擴散指標'].rolling(N2,min_periods=N2).mean()
+        raw_data_price_market['慢線'] = raw_data_price_market['快線'].rolling(period,min_periods=period).mean()
+        
+        raw_data_price_market['signal'] = np.where(raw_data_price_market['快線'] > \
+                                                   raw_data_price_market['慢線'],1,0)
+            
+        raw_data_price_market['策略報酬率'] = raw_data_price_market['報酬率'] * \
+            raw_data_price_market['signal']
+
+        tearsheet = get_tearsheet(raw_data_price_market['策略報酬率'])
+        tearsheet_all = tearsheet_all.append(tearsheet, ignore_index=True)
+    
+    tearsheet_all.index = range(lower_third, N2, 5)
+    N3 = tearsheet_all[tearsheet_all.sharpe == max(tearsheet_all.sharpe)].index.tolist()[0]
+    tearsheet_all.round(2).to_excel(writer, sheet_name= str(N3))
+   
+    return N2,N3
+
+
+#%% 策略生成 函式
+
+def cal_final_ouput(technical_indicators ,moving_style ,lower ,upper ,lower_second ,lower_third):
+    
+    writer = open_writer(technical_indicators,moving_style)
+    
+    N1 = cal_moving_first_diffusion_indicators(raw_data_price ,writer,
+                                   technical_indicators ,moving_style ,lower,upper)
+    
+    N2,N3 = cal_moving_second_diffusion_indicators(raw_data_price ,writer,technical_indicators ,moving_style,
+                                       N1 ,lower_second ,lower_third)
+
+    raw_data_price_market = cal_diffusion_indicators(raw_data_price, technical_indicators,
+                                                     moving_style, N1)
+    
+    raw_data_price_market['快線'] = raw_data_price_market['擴散指標'].rolling(N2,min_periods=N2).mean()
+    raw_data_price_market['慢線'] = raw_data_price_market['快線'].rolling(N3,min_periods=N3).mean()
+    
+    raw_data_price_market['signal做多'] = np.where(raw_data_price_market['快線'] >= \
+                                                 raw_data_price_market['慢線'],1,0)
+    
+    raw_data_price_market['signal做空'] = np.where(raw_data_price_market['快線'] >= \
+                                                 raw_data_price_market['慢線'],0,-1)
+    
+    raw_data_price_market['signal多空'] = np.where(raw_data_price_market['快線'] >= \
+                                                 raw_data_price_market['慢線'],1,-1)
+        
+    raw_data_price_market['報酬率'] = raw_data_price_market['開盤價(元)'].pct_change().shift(-1).fillna(0.0)
+    raw_data_price_market['策略報酬率做多'] = raw_data_price_market['報酬率'] * raw_data_price_market['signal做多']
+    raw_data_price_market['策略報酬率做空'] = raw_data_price_market['報酬率'] * raw_data_price_market['signal做空']
+    raw_data_price_market['策略報酬率多空'] = raw_data_price_market['報酬率'] * raw_data_price_market['signal多空']
+    
+    raw_data_price_market = raw_data_price_market.dropna()
+    draw_plots(raw_data_price_market,technical_indicators,moving_style, N1, N2, N3)
+    
+    tearsheet_all = pd.DataFrame()
+    for i in ['策略報酬率做多','策略報酬率多空','策略報酬率做空','報酬率']:
+        tearsheet = get_tearsheet(raw_data_price_market[i])
+        tearsheet_all = tearsheet_all.append(tearsheet, ignore_index=True)
+    
+    tearsheet_all.index = ['策略報酬率做多','策略報酬率多空','策略報酬率做空','台灣加權指數']
+    tearsheet_all = tearsheet_all.T
+    
+    tearsheet_all.round(2).to_excel(writer, sheet_name= '做多 多空 做空 績效表')
+    
+    writer.save()
+    writer.close()     
+
+#%% 資料前處理
+
+raw_data = pd.read_table('0050成份股.txt', sep='\t', index_col=False ,
+                          dtype={'年月日': 'str'}, usecols=['年月日', '成份股', '前日市值比重'])
+raw_data['年月日'] = pd.to_datetime(raw_data['年月日'],format='%Y%m%d')
+raw_data['成份股'] = raw_data['成份股'].str.strip()
+raw_data['前日市值比重'] = raw_data['前日市值比重'] / 100
+
+raw_data_price = pd.read_table('0050成份股收盤價.txt',dtype={'證券代碼':'str', '年月日': 'str'})
+raw_data_price['年月日'] = pd.to_datetime(raw_data_price['年月日'],format='%Y%m%d')
+raw_data_price["成份股"] = raw_data_price["證券代碼"].str.strip() + " "\
+    + raw_data_price["簡稱"].str.strip()
+
+raw_data_price = raw_data_price.sort_values(["成份股", '年月日'], ascending = (True, True))\
+    .reset_index(drop=True)
+    
+raw_data_price = raw_data_price.drop(columns=['證券代碼','簡稱'])
+
+#%% 回測各個條件下的策略
+start = time.time()
+
+cal_final_ouput(technical_indicators = 'MA指標',
+                moving_style = '等權重',
+                lower = 60,
+                upper = 250,
+                lower_second = 20,
+                lower_third = 10)
+
+end = time.time()
+print("執行時間：%f 秒" % (end - start))
+
+
+cal_final_ouput(technical_indicators = 'MA指標',
+                moving_style = '流通市值加權',
+                lower = 60,
+                upper = 250,
+                lower_second = 20,
+                lower_third = 10)
+
+end = time.time()
+print("執行時間：%f 秒" % (end - start))
+
+cal_final_ouput(technical_indicators = 'ROC指標',
+                moving_style = '等權重',
+                lower = 60,
+                upper = 250,
+                lower_second = 20,
+                lower_third = 10)
+end = time.time()
+print("執行時間：%f 秒" % (end - start))
+
+cal_final_ouput(technical_indicators = 'ROC指標',
+                moving_style = '流通市值加權',
+                lower = 60,
+                upper = 250,
+                lower_second = 20,
+                lower_third = 10)
+end = time.time()
+print("執行時間：%f 秒" % (end - start))
+
+cal_final_ouput(technical_indicators = 'KDJ指標_K_cross_D',
+                moving_style = '流通市值加權',
+                lower = 150,
+                upper = 330,
+                lower_second = 80,
+                lower_third = 40)
+end = time.time()
+print("執行時間：%f 秒" % (end - start))
+
+cal_final_ouput(technical_indicators = 'KDJ指標_D',
+                moving_style = '流通市值加權',
+                lower = 60,
+                upper = 250,
+                lower_second = 20,
+                lower_third = 10)
+end = time.time()
+print("執行時間：%f 秒" % (end - start))
+
+cal_final_ouput(technical_indicators = 'RSI指標',
+                moving_style = '流通市值加權',
+                lower = 30,
+                upper = 310,
+                lower_second = 20,
+                lower_third = 10)
+
+end = time.time()
+print("執行時間：%f 秒" % (end - start))
